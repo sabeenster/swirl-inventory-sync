@@ -44,7 +44,7 @@ async def get_menu_items() -> list[dict]:
     async with httpx.AsyncClient(timeout=60) as client:
         # Step 1: Get all menu items (for GUID → SKU mapping)
         menu_resp = await client.get(
-            f"{settings.toast_api_base}/menus/v2/menuItems",
+            f"{settings.toast_api_base}/menus/v2/menus",
             headers=headers,
         )
         menu_resp.raise_for_status()
