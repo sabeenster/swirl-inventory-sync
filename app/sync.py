@@ -1,7 +1,7 @@
 import logging
 import math
 from datetime import datetime
-from app.toast_client import get_menu_items
+from app.toast_client import get_menu_items, ToastAuthError
 from app.shopify_client import get_all_variants, set_inventory_level
 from app.config import settings
 from app.email_alerts import send_sync_summary
@@ -22,11 +22,23 @@ async def run_sync() -> dict:
     logger.info("=== Starting Toast → Shopify inventory sync ===")
 
     # --- Fetch from both systems ---
-    toast_items = await get_menu_items()
-    shopify_variants = await get_all_variants()
+    try:
+        toast_items = await get_menu_items()
+    except ToastAuthError as e:
+        logger.error(f"Toast authentication failed: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch from Toast: {e}")
+        raise
 
-    # Build SKU → Shopify variant map
-    shopify_by_sku: dict[str, dict] = {v["sku"]: v for v in shopify_variants}
+    try:
+        shopify_variants = await get_all_variants()
+    except Exception as e:
+        logger.error(f"Failed to fetch from Shopify: {e}")
+        raise
+
+    # Build SKU → Shopify variant map (case-insensitive for safety)
+    shopify_by_sku: dict[str, dict] = {v["sku"].lower(): v for v in shopify_variants}
 
     # --- Match and sync ---
     updated = []
@@ -38,11 +50,11 @@ async def run_sync() -> dict:
         sku = item["sku"]
         toast_qty = item["quantity"]
 
-        if sku not in shopify_by_sku:
+        if sku.lower() not in shopify_by_sku:
             skipped_no_match.append({"sku": sku, "name": item["name"]})
             continue
 
-        shopify_variant = shopify_by_sku[sku]
+        shopify_variant = shopify_by_sku[sku.lower()]
 
         # Apply inventory buffer — hold back a % to avoid oversells
         # e.g. 10 bottles in Toast → show 9 on Shopify
@@ -54,15 +66,20 @@ async def run_sync() -> dict:
             # Still update Shopify to 0 so it goes out of stock correctly
             buffered_qty = 0
 
-        success = await set_inventory_level(
-            inventory_item_id=shopify_variant["inventory_item_id"],
-            quantity=buffered_qty,
-        )
+        try:
+            success = await set_inventory_level(
+                inventory_item_id=shopify_variant["inventory_item_id"],
+                quantity=buffered_qty,
+            )
+        except Exception as e:
+            logger.error(f"Exception setting inventory for {sku}: {e}")
+            success = False
 
         if success:
             updated.append({
                 "sku": sku,
                 "name": item["name"],
+                "shopify_name": shopify_variant["title"],
                 "toast_qty": toast_qty,
                 "shopify_qty": buffered_qty,
             })
@@ -96,6 +113,10 @@ async def run_sync() -> dict:
     )
 
     # Send email summary (same Resend pattern as wine enrichment agent)
-    await send_sync_summary(result)
+    try:
+        await send_sync_summary(result)
+    except Exception as e:
+        logger.error(f"Failed to send email summary: {e}")
+        # Don't fail the sync over an email error
 
     return result
